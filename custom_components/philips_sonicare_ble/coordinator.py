@@ -242,6 +242,14 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._dbus_bus: MessageBus | None = None
         self._counterfeit_timer_task: asyncio.Task | None = None
         self._session_task: asyncio.Task | None = None
+        # Catching up on stored sessions nobody was connected for: the
+        # newest number the handle has reported, the task working towards
+        # it, and how often each number has failed to come through. How far
+        # it got is kept in the data (``synced_session_id``) so it survives
+        # a restart.
+        self._sync_target: int | None = None
+        self._sync_task: asyncio.Task | None = None
+        self._sync_failures: dict[int, int] = {}
         # Sessions whose time could not be established, and how often
         # that has been tried. Deliberately not persisted: a restart is
         # as good a moment as any to try the handle again.
@@ -652,6 +660,7 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         self.hass.async_create_task(self._unsubscribe_sensor_data())
                     self._file_observed_session(new_data)
                     self._start_session_end_task()
+                    self._schedule_sync()
 
         # Counterfeit brush head detection
         self._update_counterfeit(old, new_data)
@@ -856,6 +865,10 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         if started:
             self._session_peak = 0
+            # The newest number the handle had filed before this session.
+            # Whatever it files for this session comes after it, so a record
+            # at or below it answering for this session is an older one.
+            self._latest_at_start = new_data.get("latest_session_id")
         elapsed = new_data.get("brushing_time")
         if isinstance(elapsed, int) and elapsed > self._session_peak:
             self._session_peak = elapsed
@@ -947,10 +960,12 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     and new_data.get("handle_state_value") != HANDLE_STATE_RUNNING):
                 self._file_observed_session(new_data)
                 self._start_session_end_task()
+                self._schedule_sync()
 
         latest = new_data.get("latest_session_id")
         if latest is None or "latest_session_id" not in parsed:
             return
+        self._note_sync_target(new_data, latest)
 
         # Not in the middle of a session. Connecting to a handle that is
         # already running reports both the session and the id in one go, and
@@ -1006,6 +1021,141 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # How often to re-fetch a record whose time could not be established.
     # More than a couple of goes is not a retry any more, it is a loop.
     MAX_TIME_PLACE_ATTEMPTS = 2
+    # Catching up: at most this many sessions in one go (two weeks away at
+    # three a day, with room to spare), and this many tries per session
+    # before it is given up on rather than blocking everything after it.
+    MAX_BACKFILL_SESSIONS = 50
+    MAX_SYNC_ATTEMPTS = 3
+    # Fired once per stored session caught up on, and once for the newest
+    # record filed the usual way.
+    EVENT_SESSION = "philips_sonicare_ble_session"
+
+    def _fire_session_event(
+        self, record: dict[str, Any], backfill: bool
+    ) -> None:
+        """Announce one stored session on the event bus."""
+        self.hass.bus.async_fire(self.EVENT_SESSION, {
+            "entry_id": self.entry.entry_id,
+            "address": self.address,
+            "session_id": record.get("session_id"),
+            "started_at": record.get("started_at"),
+            "duration_seconds": record.get("duration"),
+            "target_duration_seconds": record.get("routine_length"),
+            "mode": record.get("brushing_mode"),
+            "intensity": record.get("intensity"),
+            "time_source": record.get("time_source"),
+            "backfill": backfill,
+        })
+
+    def _note_sync_target(self, new_data: dict[str, Any], latest: int) -> None:
+        """Remember the newest stored session and catch up when idle.
+
+        Runs whenever the handle reports its newest number, whatever it is
+        doing at the time - a handle picked up and switched on reports it
+        mid-session, and waiting for the number to change again would mean
+        waiting for the next brushing.
+
+        Where catching up starts is settled once and then persisted: the
+        record held when this first runs, or the newest number if there is
+        none. A handle's whole history is not news.
+        """
+        if not isinstance(new_data.get("synced_session_id"), int):
+            held = new_data.get("last_session") or {}
+            start = held.get("session_id")
+            if start is None:
+                start = held.get("previous_id")
+            if not isinstance(start, int) or start > latest:
+                start = latest
+            new_data["synced_session_id"] = start
+            _LOGGER.debug("%s: catching up on stored sessions after %d",
+                          self.address, start)
+        self._sync_target = latest
+        if (new_data.get("brushing_state") == "on"
+                or new_data.get("handle_state_value") == HANDLE_STATE_RUNNING):
+            # Picked up again when the session ends.
+            return
+        self._schedule_sync()
+
+    def _schedule_sync(self) -> None:
+        """Start catching up, unless that is already under way."""
+        if self._use_condor or getattr(self, "hass", None) is None:
+            return
+        task = getattr(self, "_sync_task", None)
+        if task is not None and not task.done():
+            return
+        self._sync_task = self.entry.async_create_background_task(
+            self.hass, self._run_sync(), "philips_sonicare_session_sync"
+        )
+
+    async def _run_sync(self) -> None:
+        """Fetch every stored session not yet announced, oldest first.
+
+        Each is dated by the handle's own counter, like any record found on
+        connect, and announced as an event. Progress is written after every
+        session, so a link that drops halfway loses nothing: the next
+        connect carries on where this one stopped. A session that will not
+        come through is tried again a few times and then passed over, so it
+        cannot hold back the ones after it.
+        """
+        target = getattr(self, "_sync_target", None)
+        done_upto = (self.data or {}).get("synced_session_id")
+        if not isinstance(target, int) or not isinstance(done_upto, int):
+            return
+        if target <= done_upto:
+            return
+        first = max(done_upto + 1, target - self.MAX_BACKFILL_SESSIONS + 1)
+        _LOGGER.debug("%s: catching up on stored sessions %d to %d",
+                      self.address, first, target)
+        fetched = 0
+        for sid in range(first, target + 1):
+            if not self.transport.is_connected:
+                _LOGGER.debug("%s: link lost while catching up, at %d",
+                              self.address, sid)
+                return
+            data = self.data or {}
+            if (data.get("brushing_state") == "on"
+                    or data.get("handle_state_value") == HANDLE_STATE_RUNNING):
+                _LOGGER.debug("%s: session started, catching up later",
+                              self.address)
+                return
+            try:
+                async with self._link_lock:
+                    record = await self._protocol.fetch_stored_session(sid)
+            except Exception as err:  # noqa: BLE001 - never break the flow
+                _LOGGER.debug("%s: stored session %d failed: %s",
+                              self.address, sid, err)
+                record = None
+            placed = False
+            if record and record.get("session_id") == sid:
+                started, source = self._session_started_at(record, False)
+                if started is not None:
+                    record["started_at"], record["time_source"] = started, source
+                    record["source"] = "retained_session"
+                    self._fire_session_event(record, backfill=True)
+                    placed = True
+                    fetched += 1
+            if not placed:
+                if not self.transport.is_connected:
+                    return
+                tries = self._sync_failures.get(sid, 0) + 1
+                self._sync_failures[sid] = tries
+                if tries < self.MAX_SYNC_ATTEMPTS:
+                    _LOGGER.debug(
+                        "%s: stored session %d did not come through "
+                        "(attempt %d), trying again on the next connect",
+                        self.address, sid, tries,
+                    )
+                    return
+                _LOGGER.warning(
+                    "%s: stored session %d could not be fetched or dated "
+                    "after %d attempts - skipped", self.address, sid, tries,
+                )
+            self._sync_failures.pop(sid, None)
+            self.async_set_updated_data(
+                {**(self.data or {}), "synced_session_id": sid}
+            )
+        _LOGGER.info("%s: caught up on %d stored session(s), now at %d",
+                     self.address, fetched, target)
 
     def _session_started_at(
         self, record: dict[str, Any], witnessed: bool
@@ -1080,6 +1230,16 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if held_id is None:
             held_id = held.get("previous_id")
         pending = witnessed and record.get("session_id") == held_id
+        # The record held can lag behind the handle - when the newest one
+        # could not be fetched, say - and then an older record answering for
+        # a session that just ended does not match it and would be filed as
+        # that session, dated now. Anything the handle had already filed
+        # before the session began cannot be it.
+        start_latest = getattr(self, "_latest_at_start", None)
+        rec_id = record.get("session_id")
+        if (witnessed and isinstance(start_latest, int)
+                and isinstance(rec_id, int) and rec_id <= start_latest):
+            pending = True
         if pending:
             _LOGGER.debug(
                 "%s: session %s ended but the handle still reports it as the "
@@ -1127,6 +1287,8 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         record["source"] = "retained_session"
         data = {**(self.data or {}), "last_session": record}
         self.async_set_updated_data(data)
+        if not pending and getattr(self, "hass", None) is not None:
+            self._fire_session_event(record, backfill=False)
         _LOGGER.info(
             "%s: stored session %d recorded (%ds)",
             self.address, record["session_id"], record["duration"],
