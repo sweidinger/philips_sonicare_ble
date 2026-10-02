@@ -52,6 +52,7 @@ PLATFORMS = [
 SERVICE_READ_CHARACTERISTIC = "read_characteristic"
 SERVICE_WRITE_CHARACTERISTIC = "write_characteristic"
 SERVICE_FORCE_WAKE = "force_wake"
+SERVICE_RESYNC_SESSIONS = "resync_sessions"
 
 
 def _get_coordinator(hass: HomeAssistant, entry_id: str | None):
@@ -421,6 +422,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             supports_response=SupportsResponse.ONLY,
         )
 
+    if not hass.services.has_service(DOMAIN, SERVICE_RESYNC_SESSIONS):
+        async def handle_resync_sessions(call: ServiceCall) -> ServiceResponse:
+            """Fetch stored sessions again, starting at a given number.
+
+            Moves the persisted catch-up mark back so every session from
+            ``from_session_id`` up to the newest is fetched and announced
+            once more - for sessions that were missed before catching up
+            existed, or skipped. Runs straight away when the handle is
+            connected, otherwise on its next connect. Sessions already in
+            the calendar are announced again; whatever files them is
+            expected to skip duplicates.
+            """
+            coord = _get_coordinator(hass, call.data.get("entry_id"))
+            if not coord:
+                return {"status": "no_device"}
+            first = int(call.data["from_session_id"])
+            data = dict(coord.data or {})
+            latest = data.get("latest_session_id")
+            if isinstance(latest, int) and first > latest:
+                return {"status": "error",
+                        "error": f"newest session is {latest}, nothing from {first}"}
+            data["synced_session_id"] = first - 1
+            coord._sync_failures.clear()
+            coord.async_set_updated_data(data)
+            if isinstance(latest, int):
+                coord._sync_target = latest
+            now = bool(coord.transport.is_connected and isinstance(latest, int))
+            if now:
+                coord._schedule_sync()
+            _LOGGER.info(
+                "%s: re-fetching stored sessions from %d (%s)", coord.address,
+                first, "now" if now else "on the next connect",
+            )
+            return {"status": "ok", "from_session_id": first,
+                    "to_session_id": latest, "started_now": now}
+
+        hass.services.async_register(
+            DOMAIN, SERVICE_RESYNC_SESSIONS, handle_resync_sessions,
+            schema=vol.Schema({
+                vol.Required("from_session_id"): vol.All(vol.Coerce(int), vol.Range(min=0)),
+                vol.Optional("entry_id"): str,
+            }),
+            supports_response=SupportsResponse.OPTIONAL,
+        )
+
     _LOGGER.info("Philips Sonicare integration loaded - device: %s", address)
     return True
 
@@ -442,6 +488,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_READ_CHARACTERISTIC,
             SERVICE_WRITE_CHARACTERISTIC,
             SERVICE_FORCE_WAKE,
+            SERVICE_RESYNC_SESSIONS,
         ):
             if hass.services.has_service(DOMAIN, svc):
                 hass.services.async_remove(DOMAIN, svc)

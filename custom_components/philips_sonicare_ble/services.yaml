@@ -41,3 +41,28 @@ force_wake:
       required: false
       selector:
         text:
+
+resync_sessions:
+  name: Re-fetch stored sessions
+  description: >
+    Fetch the sessions stored on the handle again, from the given session
+    number up to the newest, and announce each as a
+    philips_sonicare_ble_session event (backfill true). Runs at once when
+    the handle is connected, otherwise on its next connect.
+  fields:
+    from_session_id:
+      name: From session number
+      description: First session to fetch again (see the "latest session id" sensor).
+      required: true
+      example: 932
+      selector:
+        number:
+          min: 0
+          max: 65535
+          mode: box
+    entry_id:
+      name: Config entry ID
+      description: Optional — only needed when more than one Sonicare entry exists.
+      required: false
+      selector:
+        text:
