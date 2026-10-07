@@ -2077,6 +2077,17 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         results = await self._protocol.read_chars(read_chars)
 
+        if self._smp_failed and not any(v is not None for v in results.values()):
+            # The probe could not encrypt the link and not a single read came
+            # back: this link is no use, however many subscriptions the
+            # adapter goes on to accept. Seen on 2026-10-08 through an ESP32
+            # proxy without a bond - every read answered "Insufficient
+            # encryption", yet ten subscribes reported success and the setup
+            # carried on with a dead link instead of trying another adapter.
+            raise TransportError(
+                "Link could not be encrypted - nothing was readable"
+            )
+
         if any(v is not None for v in results.values()):
             new_data = self._process_results(results)
             new_data.pop("_connecting", None)
