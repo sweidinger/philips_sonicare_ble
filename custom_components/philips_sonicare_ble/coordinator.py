@@ -1047,6 +1047,10 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Fired once per stored session caught up on, and once for the newest
     # record filed the usual way.
     EVENT_SESSION = "philips_sonicare_ble_session"
+    # Fired when a link could not be encrypted, naming the adapter it went
+    # through. On an Android-based proxy this is the moment the system shows
+    # its pairing dialog, which nobody sees unless they stand at the panel.
+    EVENT_PAIRING_NEEDED = "philips_sonicare_ble_pairing_needed"
 
     def _fire_session_event(
         self, record: dict[str, Any], backfill: bool
@@ -1063,6 +1067,34 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "intensity": record.get("intensity"),
             "time_source": record.get("time_source"),
             "backfill": backfill,
+        })
+
+    def _fire_pairing_needed(self, error: str) -> None:
+        """Announce that the link through the current adapter is not encrypted.
+
+        ``reason`` separates the two ways this shows: ``timeout`` - the
+        adapter never answered, which is what an Android proxy does while
+        its pairing dialog waits for a tap - and ``insufficient_encryption``
+        - the adapter answered but holds no bond with the brush.
+        """
+        if getattr(self, "hass", None) is None:
+            return
+        lowered = (error or "").lower()
+        if "insufficient" in lowered and (
+            "encryption" in lowered or "authentication" in lowered
+        ):
+            reason = "insufficient_encryption"
+        elif any(t in lowered for t in ("timeout", "no response", "no answer")):
+            reason = "timeout"
+        else:
+            reason = "other"
+        self.hass.bus.async_fire(self.EVENT_PAIRING_NEEDED, {
+            "entry_id": self.entry.entry_id,
+            "address": self.address,
+            "adapter": getattr(self.transport, "connection_path", None),
+            "source": getattr(self.transport, "connected_source", None),
+            "reason": reason,
+            "error": error,
         })
 
     def _note_sync_target(self, new_data: dict[str, Any], latest: int) -> None:
@@ -1952,6 +1984,33 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         deadline = t0 + 3.0
         poll_interval = 0.2
         attempt = 0
+        # A probe read that hangs is an adapter waiting on something - on an
+        # Android proxy, its pairing dialog. Say so while the dialog is still
+        # up, not only once the read gives up half a minute later.
+        announced = False
+
+        def _announce_slow() -> None:
+            nonlocal announced
+            announced = True
+            self._fire_pairing_needed(
+                f"no answer within {self.SMP_SLOW_NOTICE:.0f} s"
+            )
+
+        slow_notice = loop.call_later(self.SMP_SLOW_NOTICE, _announce_slow)
+        try:
+            await self._probe_loop(loop, t0, deadline, poll_interval, attempt,
+                                   lambda: announced)
+        finally:
+            slow_notice.cancel()
+
+    # Seconds a probe read may hang before the pairing event goes out.
+    SMP_SLOW_NOTICE = 5.0
+
+    async def _probe_loop(
+        self, loop, t0: float, deadline: float, poll_interval: float,
+        attempt: int, already_announced: Callable[[], bool],
+    ) -> None:
+        """The polling half of :meth:`_eager_smp_probe`."""
         while True:
             attempt += 1
             if not self.transport.is_connected:
@@ -1982,6 +2041,8 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.address, attempt, err_text,
                 )
                 self._smp_failed = True
+                if not already_announced():
+                    self._fire_pairing_needed(err_text)
                 return
             await asyncio.sleep(poll_interval)
 

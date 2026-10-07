@@ -327,6 +327,12 @@ Setup is the same as Option A — Home Assistant's Bluetooth stack picks the pro
 | Pipelined GATT reads | Enabled | Send poll reads to the ESP bridge as one concurrent batch (ESP Bridge only, needs bridge firmware ≥ 1.7.0 — older bridges always read sequentially). Takes effect immediately, no reload. |
 | Warn about counterfeit brush heads | Enabled | Raise a repair warning if no valid brush head NFC serial is read after 30 seconds of brushing. |
 
+### Events
+
+| Event | When | Data |
+| :--- | :--- | :--- |
+| `philips_sonicare_ble_pairing_needed` | A direct connection could not be encrypted through an adapter. Fired after 5 s while the encryption probe still hangs (an Android-based proxy does this while its pairing dialog waits for a tap), or when the probe gives up. | `entry_id`, `address`, `adapter`, `source` (adapter MAC), `reason` (`timeout`, `insufficient_encryption`, `other`), `error` |
+
 ---
 
 ## How It Works
