@@ -735,6 +735,11 @@ DEFAULT_NOTIFY_THROTTLE = 500
 CONF_PIPELINED_READS = "pipelined_reads"
 DEFAULT_PIPELINED_READS = True
 MIN_NOTIFY_THROTTLE = 100
+
+# Direct BLE only: the scanner (by source MAC) a connect should go through
+# when it hears the brush, with every other scanner as a fallback. "auto"
+# leaves the choice to Home Assistant's RSSI ranking.
+CONF_PREFERRED_SCANNER = "preferred_scanner"
 MAX_NOTIFY_THROTTLE = 5000
 
 CONF_SENSOR_PRESSURE = "sensor_pressure"

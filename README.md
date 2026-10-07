@@ -322,6 +322,7 @@ Setup is the same as Option A — Home Assistant's Bluetooth stack picks the pro
 | Pressure Sensor | Enabled | Stream live pressure data during brushing. |
 | Temperature Sensor | Enabled | Stream live temperature data during brushing. |
 | Gyroscope Sensor | Disabled | Stream live 6-axis IMU data during brushing (experimental). |
+| Preferred Bluetooth adapter | Automatic | Direct BLE only. The adapter a connection should go through, e.g. the proxy closest to the bathroom. When the brush wakes, the connect waits up to 3 s for this adapter to report it, so Home Assistant's RSSI ranking can pick it; every other adapter stays a fallback. If a link cannot be encrypted through an adapter, that adapter is set aside for 10 minutes and the integration reconnects through another one straight away. |
 | Notify Throttle | 500ms | Minimum interval between BLE notification updates (ESP Bridge only, 100-5000ms). |
 | Pipelined GATT reads | Enabled | Send poll reads to the ESP bridge as one concurrent batch (ESP Bridge only, needs bridge firmware ≥ 1.7.0 — older bridges always read sequentially). Takes effect immediately, no reload. |
 | Warn about counterfeit brush heads | Enabled | Raise a repair warning if no valid brush head NFC serial is read after 30 seconds of brushing. |
