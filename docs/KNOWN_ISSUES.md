@@ -7,6 +7,7 @@
 - [Budget BT adapters can't scan while a GATT connection is active](#budget-bt-adapters-cant-scan-while-a-gatt-connection-is-active)
 - [Some USB dongles cannot complete SMP bonding](#some-usb-dongles-cannot-complete-smp-bonding)
 - [Toothbrush not reachable on charger](#toothbrush-not-reachable-on-charger)
+- [Deep Clean+ runs 2 minutes while connected, 3 minutes otherwise](#deep-clean-runs-2-minutes-while-connected-3-minutes-otherwise)
 - [Unnecessary pair() calls in other ESPHome projects](#unnecessary-pair-calls-in-other-esphome-projects)
 - ✅ [Bluedroid crash with bluetooth_proxy](#bluedroid-crash-with-bluetooth_proxy-fixed-in-esphome-202671) — **resolved**, fixed in ESPHome 2026.7.1
 
@@ -210,6 +211,26 @@ from the charger or turned on/off.
 
 This is not a bug — it is the toothbrush's power management behavior. The
 integration reconnects automatically when the toothbrush wakes up.
+
+---
+
+## Deep Clean+ runs 2 minutes while connected, 3 minutes otherwise
+
+**Status:** By design (handle firmware)
+
+Philips documents Deep Clean+ as "2 minutes / 3 minutes": the mode runs
+2 minutes when the toothbrush is connected to the app and 3 minutes when it
+is not ([Philips FAQ XC000005380](https://www.philips.co.uk/c-f/XC000005380/what-are-the-brushing-modes-for-my-sonicare-toothbrush)).
+The handle does not tell the Sonicare app apart from any other BLE client,
+so a live connection from this integration has the same effect.
+
+Seen on an HX991X: sessions brushed with Home Assistant connected report
+`Deep Clean+`, routine length 120 s; sessions brushed without a connection
+and fetched later from the handle's own records report `Deep Clean+`,
+180 s. The routine length characteristic (0x4091) reads 120 s while
+connected. Nothing in the integration writes it.
+
+Other modes keep their length (Clean 2:00, White+ 2:40, Gum Health 3:20).
 
 ---
 
