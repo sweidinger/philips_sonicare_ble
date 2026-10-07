@@ -26,9 +26,15 @@ except ImportError:
     HAS_DBUS_FAST = False
 
 from .transport import BleakTransport, EspBridgeTransport, SonicareTransport
+from .connection_paths import (
+    PREFERRED_SCANNER_AUTO,
+    ConnectionPathPolicy,
+    penalize_source,
+)
 from .exceptions import TransportError
 from .condor_adapter import resolve_brushing_mode
 from .const import (
+    CONF_PREFERRED_SCANNER,
     DOMAIN,
     SVC_CONDOR,
     SVC_BRUSHHEAD,
@@ -228,6 +234,18 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Session ID exists but doesn't support notify on Kids firmware
             if CHAR_SESSION_ID in self._notify_chars:
                 self._notify_chars.remove(CHAR_SESSION_ID)
+
+        # Direct BLE: the scanner a connect should go through, and the ones
+        # a link could not be encrypted through. Lives on the transport,
+        # which is where the connect happens.
+        self._path_policy = ConnectionPathPolicy(
+            options.get(CONF_PREFERRED_SCANNER, PREFERRED_SCANNER_AUTO)
+        )
+        if isinstance(transport, BleakTransport):
+            transport.path_policy = self._path_policy
+        # Set when the SMP probe ran out of time on the current link: the
+        # link was never encrypted, so nothing that follows will work on it.
+        self._smp_failed = False
 
         self._connection_lock = asyncio.Lock()
         self._live_task: asyncio.Task | None = None
@@ -1488,6 +1506,9 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     if sub_count == 0:
                         raise TransportError("No notifications could be subscribed")
                     self._live_setup_done = True
+                    if (source := getattr(self.transport, "connected_source", None)):
+                        # Carried a working link: nothing to hold against it.
+                        self._path_policy.forgive(source)
                     if self.data is None:
                         self.data = {}
                     self.data.pop("_connecting", None)
@@ -1523,10 +1544,24 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                     if self._use_condor:
                         self._protocol.invalidate_session()
+                    # Which scanner carried the link that just failed - read
+                    # before the disconnect, which forgets it.
+                    failed_source = getattr(
+                        self.transport, "connected_source", None
+                    )
                     try:
                         await self.transport.disconnect()
                     except Exception:
                         pass
+
+                    if (
+                        not self._is_esp_bridge
+                        and failed_source
+                        and self._is_link_auth_failure(err)
+                        and await self._reconnect_elsewhere(failed_source)
+                    ):
+                        # Connected through another scanner - set it up.
+                        continue
 
                     if not self._is_esp_bridge:
                         # Direct BLE: quick retries, then wait for ADV
@@ -1617,6 +1652,90 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 else:
                     await self._protocol.unsubscribe_all()
                 _LOGGER.info("%s: live connection ended", self.address)
+
+    # A link that could not be encrypted through one scanner is retried
+    # through another at most this often per failure, and each try waits
+    # this long for another scanner to report the brush.
+    MAX_PATH_FALLBACKS = 3
+    PATH_FALLBACK_WAIT = 4.0
+
+    def _is_link_auth_failure(self, err: Exception) -> bool:
+        """Whether a setup failed because the link was never encrypted.
+
+        Either the SMP probe ran out of time, or the link stayed up but no
+        notification could be subscribed - which on a bonded handle means
+        the same thing. Both are properties of the scanner the link went
+        through, not of the brush: the bond lives in that scanner, so
+        another scanner may well get through.
+        """
+        if self._smp_failed:
+            return True
+        return isinstance(err, TransportError) and (
+            "no notifications could be subscribed" in str(err).lower()
+        )
+
+    async def _reconnect_elsewhere(self, failed_source: str) -> bool:
+        """Reconnect at once through a scanner other than *failed_source*.
+
+        Home Assistant does not hold a connect that succeeded against the
+        scanner it went through, even when the link could then not be
+        encrypted, so left alone it would route the next try the same way.
+        The scanner is set aside for a while and counted as a failure in
+        HA's ranking, and the connect goes out straight away instead of
+        waiting for the next advertisement - the brush is in somebody's
+        hand right now, and the session is what we are here for.
+
+        Returns True when a link through another scanner is up.
+        """
+        policy = self._path_policy
+        policy.avoid(failed_source)
+        penalize_source(self.hass, failed_source, self.address)
+        _LOGGER.info(
+            "%s: link through %s could not be encrypted — trying another "
+            "adapter", self.address, failed_source,
+        )
+        loop = asyncio.get_running_loop()
+        for attempt in range(1, self.MAX_PATH_FALLBACKS + 1):
+            deadline = loop.time() + self.PATH_FALLBACK_WAIT
+            while not policy.has_alternative(self.hass, self.address):
+                if loop.time() >= deadline:
+                    _LOGGER.debug(
+                        "%s: no other adapter hears the device — falling "
+                        "back to the usual retry", self.address,
+                    )
+                    return False
+                await asyncio.sleep(0.25)
+            try:
+                await self.transport.connect()
+            except Exception as err:  # noqa: BLE001 - try the next one
+                _LOGGER.debug(
+                    "%s: fallback connect %d/%d failed: %s",
+                    self.address, attempt, self.MAX_PATH_FALLBACKS, err,
+                )
+                continue
+            source = getattr(self.transport, "connected_source", None)
+            if source in policy.avoided():
+                # HA routed it the same way after all. Count it again, so
+                # the ranking tips further, and go round.
+                _LOGGER.debug(
+                    "%s: fallback connect %d/%d went through %s again",
+                    self.address, attempt, self.MAX_PATH_FALLBACKS, source,
+                )
+                penalize_source(self.hass, source, self.address)
+                try:
+                    await self.transport.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            _LOGGER.info(
+                "%s: reconnected via %s after %s could not encrypt",
+                self.address, source or "?", failed_source,
+            )
+            # The disconnect above left its nudge in the wake event; the
+            # link it was about is gone and the new one needs no wake.
+            self._consume_wake()
+            return True
+        return False
 
     def _update_bridge_device_version(self) -> None:
         """Update sw_version on the ESP bridge sub-device."""
@@ -1825,6 +1944,7 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         hang setup; if we time out we proceed anyway (the ``_setup``
         path's existing per-char failures still apply).
         """
+        self._smp_failed = False
         if not self.transport.is_connected:
             return
         loop = asyncio.get_running_loop()
@@ -1861,6 +1981,7 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "subscribes may fail",
                     self.address, attempt, err_text,
                 )
+                self._smp_failed = True
                 return
             await asyncio.sleep(poll_interval)
 
@@ -1872,6 +1993,8 @@ class PhilipsSonicareCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         subset. Returns the count of successful subscriptions so the
         caller can fail the session if the device answered nothing.
         """
+        # Only this link's probe may say it was never encrypted.
+        self._smp_failed = False
         if self._scanner_needs_eager_smp():
             _LOGGER.info(
                 "%s: stock bluetooth_proxy detected — polling SMP probe "

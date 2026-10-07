@@ -146,7 +146,8 @@
           "sensor_gyroscope": "Gyroskop-Sensor aktivieren",
           "notify_throttle_ms": "Benachrichtigungs-Drosselung (ms)",
           "pipelined_reads": "Gebündelte GATT-Lesevorgänge",
-          "warn_counterfeit_brushhead": "Vor gefälschten Bürstenköpfen warnen"
+          "warn_counterfeit_brushhead": "Vor gefälschten Bürstenköpfen warnen",
+          "preferred_scanner": "Bevorzugter Bluetooth-Adapter"
         },
         "data_description": {
           "sensor_pressure": "Druckdaten während der Putzsitzung streamen.",
@@ -154,7 +155,8 @@
           "sensor_gyroscope": "6-Achsen-Bewegungsdaten während der Putzsitzung streamen. Hohe Bandbreite — auf einem vollwertigen ESP32 in der Regel unproblematisch, auf kleineren Boards wie dem ESP32-C3 kann es zu Aussetzern kommen. Nur bei Modellen mit eingebautem Bewegungssensor verfügbar.",
           "notify_throttle_ms": "Mindestabstand zwischen BLE-Benachrichtigungen, die die ESP-Bridge weiterleitet. Niedrigere Werte liefern schnellere Aktualisierungen, können den ESP aber überlasten.",
           "pipelined_reads": "Lesevorgänge als einen gleichzeitigen Stapel an die ESP-Bridge senden statt einzeln nacheinander. Erfordert Bridge-Firmware 1.7.0 oder neuer (ältere Bridges lesen immer sequenziell). Deaktiviere die Option nur, wenn nach einem Bridge-Update Lesefehler auftreten.",
-          "warn_counterfeit_brushhead": "Warnen, wenn nach 30 Sekunden Putzen keine gültige NFC-Seriennummer des Bürstenkopfs erkannt wurde."
+          "warn_counterfeit_brushhead": "Warnen, wenn nach 30 Sekunden Putzen keine gültige NFC-Seriennummer des Bürstenkopfs erkannt wurde.",
+          "preferred_scanner": "Adapter, über den die Verbindung laufen soll, sobald er die Zahnbürste empfängt – etwa der Proxy, der dem Badezimmer am nächsten ist. Wacht die Zahnbürste auf, wartet die Verbindung bis zu 3 Sekunden, bis dieser Adapter sie meldet; alle anderen Adapter bleiben Ausweichweg. „Automatisch“ überlässt Home Assistant die Wahl nach stärkstem Signal."
         }
       }
     }
@@ -436,6 +438,13 @@
     },
     "connection": {
       "name": "{device_name} Verbindung"
+    }
+  },
+  "selector": {
+    "preferred_scanner": {
+      "options": {
+        "auto": "Automatisch (stärkstes Signal)"
+      }
     }
   }
 }

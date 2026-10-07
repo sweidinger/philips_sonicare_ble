@@ -42,6 +42,7 @@ from bleak import BleakClient
 from bleak.exc import BleakError
 from bleak_retry_connector import establish_connection as bleak_establish
 
+from .connection_paths import PREFERRED_SCANNER_AUTO
 from .const import (
     DOMAIN,
     CONF_SERVICES,
@@ -52,6 +53,7 @@ from .const import (
     CONF_AREA,
     CONF_NOTIFY_THROTTLE,
     CONF_PIPELINED_READS,
+    CONF_PREFERRED_SCANNER,
     CONF_SENSOR_PRESSURE,
     CONF_SENSOR_TEMPERATURE,
     CONF_SENSOR_GYROSCOPE,
@@ -3293,6 +3295,41 @@ class PhilipsSonicareConfigFlow(ConfigFlow, domain=DOMAIN):
         return PhilipsSonicareOptionsFlow()
 
 
+def _connectable_scanner_options(
+    hass, selected: str | None
+) -> list[SelectOptionDict]:
+    """Connectable scanners to offer as the preferred connection path.
+
+    Names come from the scanners themselves (an ESPHome proxy reports its
+    device name and MAC). A saved choice whose scanner is currently gone is
+    kept in the list, so opening the options does not silently drop it.
+    """
+    scanners: list = []
+    try:
+        from habluetooth import get_manager
+
+        scanners = list(get_manager().async_current_scanners())
+    except Exception:  # noqa: BLE001 - an empty list only hides the choice
+        scanners = []
+    options: list[SelectOptionDict] = [
+        SelectOptionDict(value=PREFERRED_SCANNER_AUTO, label="Automatic"),
+    ]
+    seen: set[str] = set()
+    for scanner in sorted(
+        scanners, key=lambda sc: (getattr(sc, "name", "") or "").lower()
+    ):
+        source = getattr(scanner, "source", None)
+        if not source or source in seen or not getattr(scanner, "connectable", False):
+            continue
+        seen.add(source)
+        options.append(SelectOptionDict(
+            value=source, label=getattr(scanner, "name", None) or source,
+        ))
+    if selected and selected != PREFERRED_SCANNER_AUTO and selected not in seen:
+        options.append(SelectOptionDict(value=selected, label=selected))
+    return options
+
+
 class PhilipsSonicareOptionsFlow(OptionsFlowWithReload):
     """Options flow for Philips Sonicare BLE."""
 
@@ -3310,6 +3347,11 @@ class PhilipsSonicareOptionsFlow(OptionsFlowWithReload):
                 CONF_SENSOR_GYROSCOPE: user_input.get(CONF_SENSOR_GYROSCOPE, DEFAULT_SENSOR_GYROSCOPE),
                 CONF_WARN_COUNTERFEIT: user_input.get(CONF_WARN_COUNTERFEIT, DEFAULT_WARN_COUNTERFEIT),
             }
+            if not is_esp:
+                preferred = user_input.get(CONF_PREFERRED_SCANNER)
+                data[CONF_PREFERRED_SCANNER] = (
+                    preferred if preferred else PREFERRED_SCANNER_AUTO
+                )
             if is_esp:
                 if CONF_NOTIFY_THROTTLE in user_input:
                     data[CONF_NOTIFY_THROTTLE] = int(user_input[CONF_NOTIFY_THROTTLE])
@@ -3343,6 +3385,15 @@ class PhilipsSonicareOptionsFlow(OptionsFlowWithReload):
                 CONF_WARN_COUNTERFEIT,
                 default=options.get(CONF_WARN_COUNTERFEIT, DEFAULT_WARN_COUNTERFEIT),
             )] = bool
+
+        if not is_esp:
+            selected = options.get(CONF_PREFERRED_SCANNER, PREFERRED_SCANNER_AUTO)
+            schema_fields[vol.Required(
+                CONF_PREFERRED_SCANNER, default=selected,
+            )] = SelectSelector(SelectSelectorConfig(
+                options=_connectable_scanner_options(self.hass, selected),
+                translation_key=CONF_PREFERRED_SCANNER,
+            ))
 
         if is_esp:
             schema_fields[vol.Required(

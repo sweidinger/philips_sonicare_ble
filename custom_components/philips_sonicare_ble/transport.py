@@ -28,6 +28,7 @@ from homeassistant.helpers.event import async_track_time_interval
 
 from packaging.version import Version
 
+from .connection_paths import ConnectionPathPolicy
 from .const import BRIDGE_PIPELINED_READS_VERSION, CHAR_SERVICE_MAP
 from .exceptions import TransportError
 
@@ -407,10 +408,20 @@ class BleakTransport(SonicareTransport):
         self._last_read_errors: dict[str, str] = {}
         self._connection_path: str | None = None
         self._connected_scanner = None
+        # Which scanner a connect should prefer, and which ones to keep
+        # away from. Set by the coordinator from the entry's options.
+        self.path_policy = ConnectionPathPolicy()
 
     @property
     def is_connected(self) -> bool:
         return self._client is not None and self._client.is_connected
+
+    @property
+    def connected_source(self) -> str | None:
+        """Source (MAC) of the scanner carrying the current link."""
+        if self._connected_scanner is None:
+            return None
+        return getattr(self._connected_scanner, "source", None)
 
     @property
     def connection_path(self) -> str | None:
@@ -435,6 +446,10 @@ class BleakTransport(SonicareTransport):
         return int(rssi)
 
     async def connect(self) -> None:
+        # Give the preferred scanner its moment before HA ranks the paths:
+        # it can only win if it has reported the brush by then.
+        await self.path_policy.wait_for_preferred(self._hass, self._address)
+
         service_info = async_last_service_info(self._hass, self._address)
         if not service_info:
             raise TransportError(f"Device {self._address} not in range")
